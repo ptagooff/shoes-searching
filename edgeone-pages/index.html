@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="description" content="跨鞋厂的鞋底图片搜索" />
+  <title>鞋底智搜</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <header><div class="brand">鞋底智搜 <span>SOLE VISION</span></div><div id="syncState" class="status">正在检查新品…</div></header>
+  <main>
+    <section class="hero"><p>VISUAL SEARCH</p><h1>上传一张鞋子侧面图<br />搜索全部鞋厂鞋底</h1><span>真实来源 · 自动增量更新 · 图片不落盘</span></section>
+    <section class="search-panel">
+      <label id="dropzone" class="dropzone">
+        <input id="fileInput" type="file" accept="image/*" />
+        <img id="preview" alt="待识别图片" hidden />
+        <div id="prompt"><b>＋</b><strong>上传或拖入鞋子侧面图</strong><small>JPG、PNG、WebP，最大 12MB</small></div>
+      </label>
+      <button id="searchButton" disabled>选择图片后开始识图</button>
+    </section>
+    <section class="results"><div class="result-head"><div><p>MATCHES</p><h2>相似鞋底</h2></div><span id="resultCount">等待上传</span></div><div id="grid" class="grid"><div class="empty">识图结果会显示在这里</div></div></section>
+  </main>
+  <script src="./config.js"></script><script src="./app.js"></script>
+</body>
+</html>
