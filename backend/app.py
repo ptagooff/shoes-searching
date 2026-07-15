@@ -21,6 +21,8 @@ DB_PATH = Path(os.getenv("DB_PATH", "./data/sole_search.db"))
 ALLOWED_ORIGINS = [x.strip() for x in os.getenv("ALLOWED_ORIGINS", "*").split(",") if x.strip()]
 DATA_SOURCES_JSON = os.getenv("DATA_SOURCES_JSON", "[]")
 MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(12 * 1024 * 1024)))
+SYNC_BATCH_SIZE = int(os.getenv("SYNC_BATCH_SIZE", "40"))
+MAX_SYNC_ATTEMPTS = int(os.getenv("MAX_SYNC_ATTEMPTS", "2"))
 
 
 @dataclass(frozen=True)
@@ -84,6 +86,14 @@ def init_db() -> None:
                 db.execute("INSERT OR IGNORE INTO products_new (image_url, phash) SELECT image_url, phash FROM products")
             db.execute("DROP TABLE products")
             db.execute("ALTER TABLE products_new RENAME TO products")
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS sync_queue (
+                image_url TEXT PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT ''
+            )
+        """)
 
 
 @app.on_event("startup")
@@ -124,6 +134,65 @@ def request_bytes(url: str) -> bytes:
 def product_count() -> int:
     with connect() as db:
         return int(db.execute("SELECT COUNT(*) FROM products").fetchone()[0])
+
+
+def queue_counts() -> dict[str, int]:
+    with connect() as db:
+        rows = db.execute("SELECT status, COUNT(*) AS count FROM sync_queue GROUP BY status").fetchall()
+    counts = {"pending": 0, "done": 0, "failed": 0}
+    for row in rows:
+        counts[str(row["status"])] = int(row["count"])
+    return counts
+
+
+def enqueue_urls(urls: list[str]) -> int:
+    added = 0
+    with connect() as db:
+        existing_products = {row[0] for row in db.execute("SELECT image_url FROM products").fetchall()}
+        for url in urls:
+            if url in existing_products:
+                db.execute("""
+                    INSERT OR IGNORE INTO sync_queue (image_url, status, attempts, last_error)
+                    VALUES (?, 'done', 0, '')
+                """, (url,))
+                continue
+            before = db.total_changes
+            db.execute("""
+                INSERT OR IGNORE INTO sync_queue (image_url, status, attempts, last_error)
+                VALUES (?, 'pending', 0, '')
+            """, (url,))
+            if db.total_changes > before:
+                added += 1
+    return added
+
+
+def pending_urls(limit: int) -> list[str]:
+    with connect() as db:
+        rows = db.execute("""
+            SELECT image_url
+            FROM sync_queue
+            WHERE status = 'pending' AND attempts < ?
+            ORDER BY attempts ASC, image_url ASC
+            LIMIT ?
+        """, (MAX_SYNC_ATTEMPTS, limit)).fetchall()
+    return [str(row["image_url"]) for row in rows]
+
+
+def mark_done(image_url: str) -> None:
+    with connect() as db:
+        db.execute("UPDATE sync_queue SET status = 'done', last_error = '' WHERE image_url = ?", (image_url,))
+
+
+def mark_failed(image_url: str, error: str) -> None:
+    with connect() as db:
+        row = db.execute("SELECT attempts FROM sync_queue WHERE image_url = ?", (image_url,)).fetchone()
+        attempts = int(row["attempts"]) + 1 if row else 1
+        status = "failed" if attempts >= MAX_SYNC_ATTEMPTS else "pending"
+        db.execute("""
+            UPDATE sync_queue
+            SET status = ?, attempts = ?, last_error = ?
+            WHERE image_url = ?
+        """, (status, attempts, error[:220], image_url))
 
 
 def make_phash(data: bytes) -> str:
@@ -181,26 +250,37 @@ def health() -> dict[str, Any]:
 
 @app.get("/stats")
 def stats() -> dict[str, Any]:
+    counts = queue_counts()
     return {
         "ok": True,
         "sources": len(SOURCES),
         "products": product_count(),
+        "queue": counts,
+        "pending": counts["pending"],
+        "failed_total": counts["failed"],
         "last_sync": last_sync,
     }
 
 
 @app.post("/sync")
-def sync() -> dict[str, Any]:
+def sync(reset_failed: bool = Query(False)) -> dict[str, Any]:
     global last_sync
+    if reset_failed:
+        with connect() as db:
+            db.execute("UPDATE sync_queue SET status = 'pending', attempts = 0, last_error = '' WHERE status = 'failed'")
+
     discovered: list[str] = []
     source_reports: list[dict[str, Any]] = []
-    for source in SOURCES:
-        report = collect_source_urls(source)
-        urls = report.pop("urls")
-        report["discovered"] = len(urls)
-        source_reports.append(report)
-        discovered.extend(urls)
+    counts_before = queue_counts()
+    if counts_before["pending"] == 0:
+        for source in SOURCES:
+            report = collect_source_urls(source)
+            urls = report.pop("urls")
+            report["discovered"] = len(urls)
+            source_reports.append(report)
+            discovered.extend(urls)
     discovered = list(dict.fromkeys(discovered))
+    queued_new = enqueue_urls(discovered) if discovered else 0
 
     with connect() as db:
         existing = {row[0] for row in db.execute("SELECT image_url FROM products").fetchall()}
@@ -209,14 +289,17 @@ def sync() -> dict[str, Any]:
     skipped_existing = 0
     failed = 0
     failure_samples: list[dict[str, str]] = []
-    for image_url in discovered:
+    batch = pending_urls(SYNC_BATCH_SIZE)
+    for image_url in batch:
         if image_url in existing:
             skipped_existing += 1
+            mark_done(image_url)
             continue
         try:
             phash = make_phash(request_bytes(image_url))
         except Exception as exc:
             failed += 1
+            mark_failed(image_url, str(exc))
             if len(failure_samples) < 10:
                 failure_samples.append({"url": image_url, "error": str(exc)[:220]})
             continue
@@ -224,12 +307,19 @@ def sync() -> dict[str, Any]:
             db.execute("INSERT OR IGNORE INTO products (image_url, phash) VALUES (?, ?)", (image_url, phash))
             if db.total_changes:
                 inserted += 1
+        mark_done(image_url)
+    counts_after = queue_counts()
     last_sync = {
         "updated": True,
         "discovered": len(discovered),
+        "queued_new": queued_new,
+        "processed": len(batch),
         "inserted": inserted,
         "skipped_existing": skipped_existing,
         "failed": failed,
+        "pending": counts_after["pending"],
+        "failed_total": counts_after["failed"],
+        "complete": counts_after["pending"] == 0,
         "products": product_count(),
         "sources": source_reports,
         "failure_samples": failure_samples,
