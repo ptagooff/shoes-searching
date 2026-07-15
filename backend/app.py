@@ -44,6 +44,7 @@ def load_sources() -> list[Source]:
 
 
 SOURCES = load_sources()
+last_sync: dict[str, Any] = {}
 app = FastAPI(title="鞋底识图 API")
 app.add_middleware(
     CORSMiddleware,
@@ -120,6 +121,11 @@ def request_bytes(url: str) -> bytes:
     return b"".join(chunks)
 
 
+def product_count() -> int:
+    with connect() as db:
+        return int(db.execute("SELECT COUNT(*) FROM products").fetchone()[0])
+
+
 def make_phash(data: bytes) -> str:
     try:
         with Image.open(io.BytesIO(data)) as image:
@@ -143,8 +149,9 @@ def extract_urls_from_json(source: Source, payload: Any) -> list[str]:
     return [url for url in urls if isinstance(url, str) and url.startswith(("http://", "https://"))]
 
 
-def collect_source_urls(source: Source) -> list[str]:
+def collect_source_urls(source: Source) -> dict[str, Any]:
     urls: list[str] = []
+    page_errors: list[dict[str, Any]] = []
     for page in range(source.start_page, source.start_page + source.max_pages):
         try:
             response = requests.get(source_page_url(source, page), timeout=30, allow_redirects=True, headers={"User-Agent": "Mozilla/5.0"})
@@ -154,9 +161,17 @@ def collect_source_urls(source: Source) -> list[str]:
             else:
                 html = response.content.decode(source.encoding, errors="ignore")
                 urls.extend(extract_urls_from_html(source, html))
-        except Exception:
+        except Exception as exc:
+            if len(page_errors) < 10:
+                page_errors.append({"page": page, "error": str(exc)[:180]})
             continue
-    return list(dict.fromkeys(urls))
+    return {
+        "source": source.name or source.list_url,
+        "start_page": source.start_page,
+        "max_pages": source.max_pages,
+        "urls": list(dict.fromkeys(urls)),
+        "page_errors": page_errors,
+    }
 
 
 @app.get("/health")
@@ -164,29 +179,62 @@ def health() -> dict[str, Any]:
     return {"ok": True, "sources": len(SOURCES)}
 
 
+@app.get("/stats")
+def stats() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "sources": len(SOURCES),
+        "products": product_count(),
+        "last_sync": last_sync,
+    }
+
+
 @app.post("/sync")
 def sync() -> dict[str, Any]:
+    global last_sync
     discovered: list[str] = []
+    source_reports: list[dict[str, Any]] = []
     for source in SOURCES:
-        discovered.extend(collect_source_urls(source))
+        report = collect_source_urls(source)
+        urls = report.pop("urls")
+        report["discovered"] = len(urls)
+        source_reports.append(report)
+        discovered.extend(urls)
     discovered = list(dict.fromkeys(discovered))
 
     with connect() as db:
         existing = {row[0] for row in db.execute("SELECT image_url FROM products").fetchall()}
 
     inserted = 0
+    skipped_existing = 0
+    failed = 0
+    failure_samples: list[dict[str, str]] = []
     for image_url in discovered:
         if image_url in existing:
+            skipped_existing += 1
             continue
         try:
             phash = make_phash(request_bytes(image_url))
-        except Exception:
+        except Exception as exc:
+            failed += 1
+            if len(failure_samples) < 10:
+                failure_samples.append({"url": image_url, "error": str(exc)[:220]})
             continue
         with connect() as db:
             db.execute("INSERT OR IGNORE INTO products (image_url, phash) VALUES (?, ?)", (image_url, phash))
             if db.total_changes:
                 inserted += 1
-    return {"updated": True, "discovered": len(discovered), "inserted": inserted}
+    last_sync = {
+        "updated": True,
+        "discovered": len(discovered),
+        "inserted": inserted,
+        "skipped_existing": skipped_existing,
+        "failed": failed,
+        "products": product_count(),
+        "sources": source_reports,
+        "failure_samples": failure_samples,
+    }
+    return last_sync
 
 
 @app.post("/search")
